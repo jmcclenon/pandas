@@ -15,11 +15,12 @@ import pytz
 import pytest
 
 import pandas as pd
-from pandas._libs import tslib, lib
+from pandas._libs import tslib, lib, missing as libmissing
 from pandas import (Series, Index, DataFrame, Timedelta,
                     DatetimeIndex, TimedeltaIndex, Timestamp,
-                    Panel, Period, Categorical, isna)
-from pandas.compat import u, PY2, PY3, StringIO, lrange
+                    Panel, Period, Categorical, isna, Interval,
+                    DateOffset)
+from pandas.compat import u, PY2, StringIO, lrange
 from pandas.core.dtypes import inference
 from pandas.core.dtypes.common import (
     is_timedelta64_dtype,
@@ -37,6 +38,7 @@ from pandas.core.dtypes.common import (
     _ensure_int32,
     _ensure_categorical)
 from pandas.util import testing as tm
+import pandas.util._test_decorators as td
 
 
 @pytest.fixture(params=[True, False], ids=str)
@@ -76,6 +78,23 @@ def test_is_list_like_fails(ll):
     assert not inference.is_list_like(ll)
 
 
+def test_is_array_like():
+    assert inference.is_array_like(Series([]))
+    assert inference.is_array_like(Series([1, 2]))
+    assert inference.is_array_like(np.array(["a", "b"]))
+    assert inference.is_array_like(Index(["2016-01-01"]))
+
+    class DtypeList(list):
+        dtype = "special"
+
+    assert inference.is_array_like(DtypeList())
+
+    assert not inference.is_array_like([1, 2, 3])
+    assert not inference.is_array_like(tuple())
+    assert not inference.is_array_like("foo")
+    assert not inference.is_array_like(123)
+
+
 @pytest.mark.parametrize('inner', [
     [], [1], (1, ), (1, 2), {'a': 1}, set([1, 'a']), Series([1]),
     Series([]), Series(['a']).str, (x for x in range(5))
@@ -109,7 +128,7 @@ def test_is_dict_like_fails(ll):
     assert not inference.is_dict_like(ll)
 
 
-def test_is_file_like():
+def test_is_file_like(mock):
     class MockFile(object):
         pass
 
@@ -147,10 +166,7 @@ def test_is_file_like():
     # Iterator but no read / write attributes
     data = [1, 2, 3]
     assert not is_file(data)
-
-    if PY3:
-        from unittest import mock
-        assert not is_file(mock.Mock())
+    assert not is_file(mock.Mock())
 
 
 @pytest.mark.parametrize(
@@ -260,17 +276,17 @@ class TestInference(object):
 
     def test_isinf_scalar(self):
         # GH 11352
-        assert lib.isposinf_scalar(float('inf'))
-        assert lib.isposinf_scalar(np.inf)
-        assert not lib.isposinf_scalar(-np.inf)
-        assert not lib.isposinf_scalar(1)
-        assert not lib.isposinf_scalar('a')
+        assert libmissing.isposinf_scalar(float('inf'))
+        assert libmissing.isposinf_scalar(np.inf)
+        assert not libmissing.isposinf_scalar(-np.inf)
+        assert not libmissing.isposinf_scalar(1)
+        assert not libmissing.isposinf_scalar('a')
 
-        assert lib.isneginf_scalar(float('-inf'))
-        assert lib.isneginf_scalar(-np.inf)
-        assert not lib.isneginf_scalar(np.inf)
-        assert not lib.isneginf_scalar(1)
-        assert not lib.isneginf_scalar('a')
+        assert libmissing.isneginf_scalar(float('-inf'))
+        assert libmissing.isneginf_scalar(-np.inf)
+        assert not libmissing.isneginf_scalar(np.inf)
+        assert not libmissing.isneginf_scalar(1)
+        assert not libmissing.isneginf_scalar('a')
 
     def test_maybe_convert_numeric_infinities(self):
         # see gh-13274
@@ -388,6 +404,13 @@ class TestInference(object):
         result = lib.maybe_convert_numeric(case, set(), coerce_numeric=coerce)
         tm.assert_almost_equal(result, expected)
 
+    @pytest.mark.parametrize("value", [-2**63 - 1, 2**64])
+    def test_convert_int_overflow(self, value):
+        # see gh-18584
+        arr = np.array([value], dtype=object)
+        result = lib.maybe_convert_objects(arr)
+        tm.assert_numpy_array_equal(arr, result)
+
     def test_maybe_convert_objects_uint64(self):
         # see gh-4471
         arr = np.array([2**63], dtype=object)
@@ -418,6 +441,10 @@ class TestInference(object):
 
 
 class TestTypeInference(object):
+
+    # Dummy class used for testing with Python objects
+    class Dummy():
+        pass
 
     def test_length_zero(self):
         result = lib.infer_dtype(np.array([], dtype='i4'))
@@ -654,6 +681,72 @@ class TestTypeInference(object):
         arr = np.array([pd.Period('2011-01', freq='M'), np.datetime64('nat')],
                        dtype=object)
         assert lib.infer_dtype(arr) == 'mixed'
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            [datetime(2017, 6, 12, 19, 30), datetime(2017, 3, 11, 1, 15)],
+            [Timestamp("20170612"), Timestamp("20170311")],
+            [Timestamp("20170612", tz='US/Eastern'),
+             Timestamp("20170311", tz='US/Eastern')],
+            [date(2017, 6, 12),
+             Timestamp("20170311", tz='US/Eastern')],
+            [np.datetime64("2017-06-12"), np.datetime64("2017-03-11")],
+            [np.datetime64("2017-06-12"), datetime(2017, 3, 11, 1, 15)]
+        ]
+    )
+    def test_infer_datetimelike_array_datetime(self, data):
+        assert lib.infer_datetimelike_array(data) == "datetime"
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            [timedelta(2017, 6, 12), timedelta(2017, 3, 11)],
+            [timedelta(2017, 6, 12), date(2017, 3, 11)],
+            [np.timedelta64(2017, "D"), np.timedelta64(6, "s")],
+            [np.timedelta64(2017, "D"), timedelta(2017, 3, 11)]
+        ]
+    )
+    def test_infer_datetimelike_array_timedelta(self, data):
+        assert lib.infer_datetimelike_array(data) == "timedelta"
+
+    def test_infer_datetimelike_array_date(self):
+        arr = [date(2017, 6, 12), date(2017, 3, 11)]
+        assert lib.infer_datetimelike_array(arr) == "date"
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            ["2017-06-12", "2017-03-11"],
+            [20170612, 20170311],
+            [20170612.5, 20170311.8],
+            [Dummy(), Dummy()],
+            [Timestamp("20170612"), Timestamp("20170311", tz='US/Eastern')],
+            [Timestamp("20170612"), 20170311],
+            [timedelta(2017, 6, 12), Timestamp("20170311", tz='US/Eastern')]
+        ]
+    )
+    def test_infer_datetimelike_array_mixed(self, data):
+        assert lib.infer_datetimelike_array(data) == "mixed"
+
+    @pytest.mark.parametrize(
+        "first, expected",
+        [
+            [[None], "mixed"],
+            [[np.nan], "mixed"],
+            [[pd.NaT], "nat"],
+            [[datetime(2017, 6, 12, 19, 30), pd.NaT], "datetime"],
+            [[np.datetime64("2017-06-12"), pd.NaT], "datetime"],
+            [[date(2017, 6, 12), pd.NaT], "date"],
+            [[timedelta(2017, 6, 12), pd.NaT], "timedelta"],
+            [[np.timedelta64(2017, "D"), pd.NaT], "timedelta"]
+        ]
+    )
+    @pytest.mark.parametrize("second", [None, np.nan])
+    def test_infer_datetimelike_array_nan_nat_like(self, first, second,
+                                                   expected):
+        first.append(second)
+        assert lib.infer_datetimelike_array(first) == expected
 
     def test_infer_dtype_all_nan_nat_like(self):
         arr = np.array([np.nan, np.nan])
@@ -1019,9 +1112,9 @@ class TestNumberScalar(object):
         assert not is_timedelta64_ns_dtype(tdi.astype('timedelta64[h]'))
 
 
-class Testisscalar(object):
+class TestIsScalar(object):
 
-    def test_isscalar_builtin_scalars(self):
+    def test_is_scalar_builtin_scalars(self):
         assert is_scalar(None)
         assert is_scalar(True)
         assert is_scalar(False)
@@ -1036,7 +1129,7 @@ class Testisscalar(object):
         assert is_scalar(timedelta(hours=1))
         assert is_scalar(pd.NaT)
 
-    def test_isscalar_builtin_nonscalars(self):
+    def test_is_scalar_builtin_nonscalars(self):
         assert not is_scalar({})
         assert not is_scalar([])
         assert not is_scalar([1])
@@ -1045,7 +1138,7 @@ class Testisscalar(object):
         assert not is_scalar(slice(None))
         assert not is_scalar(Ellipsis)
 
-    def test_isscalar_numpy_array_scalars(self):
+    def test_is_scalar_numpy_array_scalars(self):
         assert is_scalar(np.int64(1))
         assert is_scalar(np.float64(1.))
         assert is_scalar(np.int32(1))
@@ -1056,7 +1149,7 @@ class Testisscalar(object):
         assert is_scalar(np.datetime64('2014-01-01'))
         assert is_scalar(np.timedelta64(1, 'h'))
 
-    def test_isscalar_numpy_zerodim_arrays(self):
+    def test_is_scalar_numpy_zerodim_arrays(self):
         for zerodim in [np.array(1), np.array('foobar'),
                         np.array(np.datetime64('2014-01-01')),
                         np.array(np.timedelta64(1, 'h')),
@@ -1064,17 +1157,19 @@ class Testisscalar(object):
             assert not is_scalar(zerodim)
             assert is_scalar(lib.item_from_zerodim(zerodim))
 
-    def test_isscalar_numpy_arrays(self):
+    def test_is_scalar_numpy_arrays(self):
         assert not is_scalar(np.array([]))
         assert not is_scalar(np.array([[]]))
         assert not is_scalar(np.matrix('1; 2'))
 
-    def test_isscalar_pandas_scalars(self):
+    def test_is_scalar_pandas_scalars(self):
         assert is_scalar(Timestamp('2014-01-01'))
         assert is_scalar(Timedelta(hours=1))
         assert is_scalar(Period('2014-01-01'))
+        assert is_scalar(Interval(left=0, right=1))
+        assert is_scalar(DateOffset(days=1))
 
-    def test_lisscalar_pandas_containers(self):
+    def test_is_scalar_pandas_containers(self):
         assert not is_scalar(Series())
         assert not is_scalar(Series([1]))
         assert not is_scalar(DataFrame())
@@ -1109,12 +1204,12 @@ def test_nan_to_nat_conversions():
 
     # numpy < 1.7.0 is wrong
     from distutils.version import LooseVersion
-    if LooseVersion(np.__version__) >= '1.7.0':
+    if LooseVersion(np.__version__) >= LooseVersion('1.7.0'):
         assert (s[8].value == np.datetime64('NaT').astype(np.int64))
 
 
+@td.skip_if_no_scipy
 def test_is_scipy_sparse(spmatrix):  # noqa: F811
-    tm._skip_if_no_scipy()
     assert is_scipy_sparse(spmatrix([[0, 1]]))
     assert not is_scipy_sparse(np.array([1]))
 
